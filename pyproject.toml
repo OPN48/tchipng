@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tchipng"
+version = "0.1.0"
+description = "甜气可见色压缩，供本机命令行和 Python 调用"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "opn48", email = "cuba3@163.com" },
+]
+keywords = ["png", "jpeg", "image-compression", "tchipng"]
+
+[project.urls]
+Homepage = "https://github.com/OPN48/tchipng"
+Repository = "https://github.com/OPN48/tchipng.git"
+
+[project.scripts]
+tchipng = "tchipng.cli:main"
+
+[tool.scikit-build]
+build-dir = "build-python/{cache_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["python/tchipng"]
