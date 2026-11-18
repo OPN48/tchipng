@@ -5,6 +5,7 @@
 #include <zlib.h>
 
 #define TCHIPNG_PALETTE 256
+#define TCHIPNG_MIX_L1 48
 
 typedef struct ColorRec {
     uint8_t rgb[3];
@@ -73,6 +74,13 @@ static int collect_unique(const uint8_t *rgb, int width, int height, int stride,
     return TCHIPNG_OK;
 }
 
+static int mapping_distance(const uint8_t *left, const uint8_t *right) {
+    int dr = (int)left[0] - (int)right[0];
+    int dg = (int)left[1] - (int)right[1];
+    int db = (int)left[2] - (int)right[2];
+    return dr * dr + dg * dg + db * db;
+}
+
 static void box_score(const Box *box, int *channel, double *score) {
     double sum_w = 0.0;
     double sum[3] = {0.0, 0.0, 0.0};
@@ -87,20 +95,20 @@ static void box_score(const Box *box, int *channel, double *score) {
         return;
     }
     for (i = 0; i < box->count; i++) {
-        double weight = (double)box->items[i].count;
-        sum_w += weight;
+        double count = (double)box->items[i].count;
+        sum_w += count;
         for (c = 0; c < 3; c++) {
-            sum[c] += (double)box->items[i].rgb[c] * weight;
+            sum[c] += (double)box->items[i].rgb[c] * count;
         }
     }
     for (c = 0; c < 3; c++) {
         mean[c] = sum[c] / sum_w;
     }
     for (i = 0; i < box->count; i++) {
-        double weight = (double)box->items[i].count;
+        double count = (double)box->items[i].count;
         for (c = 0; c < 3; c++) {
             double delta = (double)box->items[i].rgb[c] - mean[c];
-            var[c] += delta * delta * weight;
+            var[c] += delta * delta * count;
         }
     }
     for (c = 0; c < 3; c++) {
@@ -112,6 +120,10 @@ static void box_score(const Box *box, int *channel, double *score) {
         }
     }
     *channel = best;
+    if (var[best] < 1.0) {
+        *score = -1.0;
+        return;
+    }
     *score = var[best] * sum_w;
 }
 
@@ -209,32 +221,25 @@ static int split_box(Box *box, int channel, Box *left, Box *right) {
 static void snap_color(const Box *box, uint8_t out[3]) {
     double sum_w = 0.0;
     double sum[3] = {0.0, 0.0, 0.0};
-    double best = 0.0;
-    int best_index = 0;
     int i;
     int c;
     for (i = 0; i < box->count; i++) {
-        double weight = (double)box->items[i].count;
-        sum_w += weight;
+        double count = (double)box->items[i].count;
+        sum_w += count;
         for (c = 0; c < 3; c++) {
-            sum[c] += (double)box->items[i].rgb[c] * weight;
+            sum[c] += (double)box->items[i].rgb[c] * count;
         }
     }
     for (c = 0; c < 3; c++) {
-        sum[c] /= sum_w;
-    }
-    for (i = 0; i < box->count; i++) {
-        double distance = 0.0;
-        for (c = 0; c < 3; c++) {
-            double delta = (double)box->items[i].rgb[c] - sum[c];
-            distance += delta * delta;
+        double value = sum[c] / sum_w;
+        if (value < 0.0) {
+            value = 0.0;
         }
-        if (i == 0 || distance < best) {
-            best = distance;
-            best_index = i;
+        if (value > 255.0) {
+            value = 255.0;
         }
+        out[c] = (uint8_t)(value + 0.5);
     }
-    memcpy(out, box->items[best_index].rgb, 3);
 }
 
 static int cmp_rgb3(const void *left, const void *right) {
@@ -252,15 +257,52 @@ static int cmp_rgb3(const void *left, const void *right) {
     return 0;
 }
 
+static int channel_l1(const uint8_t *left, const uint8_t *right) {
+    int sum = 0;
+    int c;
+    for (c = 0; c < 3; c++) {
+        int delta = (int)left[c] - (int)right[c];
+        if (delta < 0) {
+            delta = -delta;
+        }
+        sum += delta;
+    }
+    return sum;
+}
+
+static void nearest_two(const uint8_t rgb[3], const uint8_t *palette, int palette_count, int *best, int *second) {
+    int best_index = 0;
+    int second_index = 0;
+    int best_distance = 0;
+    int second_distance = 0;
+    int have_second = 0;
+    int i;
+    for (i = 0; i < palette_count; i++) {
+        int distance = mapping_distance(rgb, palette + i * 3);
+        if (i == 0 || distance < best_distance) {
+            if (i != 0) {
+                second_distance = best_distance;
+                second_index = best_index;
+                have_second = 1;
+            }
+            best_distance = distance;
+            best_index = i;
+        } else if (!have_second || distance < second_distance) {
+            second_distance = distance;
+            second_index = i;
+            have_second = 1;
+        }
+    }
+    *best = best_index;
+    *second = second_index;
+}
+
 static int nearest_index(const uint8_t rgb[3], const uint8_t *palette, int palette_count) {
     int best = 0;
     int best_distance = 0;
     int i;
     for (i = 0; i < palette_count; i++) {
-        int dr = (int)rgb[0] - (int)palette[i * 3];
-        int dg = (int)rgb[1] - (int)palette[i * 3 + 1];
-        int db = (int)rgb[2] - (int)palette[i * 3 + 2];
-        int distance = dr * dr + dg * dg + db * db;
+        int distance = mapping_distance(rgb, palette + i * 3);
         if (i == 0 || distance < best_distance) {
             best_distance = distance;
             best = i;
@@ -268,6 +310,8 @@ static int nearest_index(const uint8_t rgb[3], const uint8_t *palette, int palet
     }
     return best;
 }
+
+static int refine_palette(ColorRec *colors, int color_count, uint8_t *palette, int palette_count);
 
 static int fill_palette(Box *boxes, int box_count, ColorRec *all_colors, int color_count, uint8_t *palette, int *palette_count) {
     uint8_t raw[TCHIPNG_PALETTE * 3];
@@ -312,10 +356,7 @@ static int fill_palette(Box *boxes, int box_count, ColorRec *all_colors, int col
                     int best_distance = 0;
                     int p;
                     for (p = 0; p < unique_count; p++) {
-                        int dr = (int)all_colors[i].rgb[0] - (int)unique[p * 3];
-                        int dg = (int)all_colors[i].rgb[1] - (int)unique[p * 3 + 1];
-                        int db = (int)all_colors[i].rgb[2] - (int)unique[p * 3 + 2];
-                        int distance = dr * dr + dg * dg + db * db;
+                        int distance = mapping_distance(all_colors[i].rgb, unique + p * 3);
                         if (p == 0 || distance < best_distance) {
                             best_distance = distance;
                             best = p;
@@ -350,6 +391,50 @@ static int fill_palette(Box *boxes, int box_count, ColorRec *all_colors, int col
     }
     memcpy(palette, unique, (size_t)unique_count * 3);
     *palette_count = unique_count;
+    return refine_palette(all_colors, color_count, palette, unique_count);
+}
+
+static int refine_palette(ColorRec *colors, int color_count, uint8_t *palette, int palette_count) {
+    double *sum = (double *)calloc((size_t)palette_count * 3, sizeof(double));
+    double *weight = (double *)calloc((size_t)palette_count, sizeof(double));
+    int iter;
+    if (sum == NULL || weight == NULL) {
+        free(sum);
+        free(weight);
+        return TCHIPNG_ERR_NOMEM;
+    }
+    for (iter = 0; iter < 8; iter++) {
+        int i;
+        memset(sum, 0, (size_t)palette_count * 3 * sizeof(double));
+        memset(weight, 0, (size_t)palette_count * sizeof(double));
+        for (i = 0; i < color_count; i++) {
+            int index = nearest_index(colors[i].rgb, palette, palette_count);
+            double count = (double)colors[i].count;
+            int c;
+            weight[index] += count;
+            for (c = 0; c < 3; c++) {
+                sum[(size_t)index * 3 + (size_t)c] += (double)colors[i].rgb[c] * count;
+            }
+        }
+        for (i = 0; i < palette_count; i++) {
+            int c;
+            if (weight[i] <= 0.0) {
+                continue;
+            }
+            for (c = 0; c < 3; c++) {
+                double value = sum[(size_t)i * 3 + (size_t)c] / weight[i];
+                if (value < 0.0) {
+                    value = 0.0;
+                }
+                if (value > 255.0) {
+                    value = 255.0;
+                }
+                palette[i * 3 + c] = (uint8_t)(value + 0.5);
+            }
+        }
+    }
+    free(sum);
+    free(weight);
     return TCHIPNG_OK;
 }
 
@@ -593,6 +678,109 @@ static int encode_indexed_png(int width, int height, const uint8_t *indexes, con
     return TCHIPNG_OK;
 }
 
+static void add_diffused(int16_t *row, int width, int x, int channel, int value) {
+    int sum;
+    if (x < 0 || x >= width) {
+        return;
+    }
+    sum = (int)row[(size_t)x * 3 + (size_t)channel] + value;
+    if (sum > 32767) {
+        sum = 32767;
+    }
+    if (sum < -32768) {
+        sum = -32768;
+    }
+    row[(size_t)x * 3 + (size_t)channel] = (int16_t)sum;
+}
+
+static int diffuse_indexes(
+    const uint8_t *rgb,
+    int width,
+    int height,
+    int stride,
+    const uint8_t *palette,
+    int palette_count,
+    uint8_t *indexes) {
+    int16_t *curr = (int16_t *)calloc((size_t)width * 3, sizeof(int16_t));
+    int16_t *next = (int16_t *)calloc((size_t)width * 3, sizeof(int16_t));
+    int y;
+    if (curr == NULL || next == NULL) {
+        free(curr);
+        free(next);
+        return TCHIPNG_ERR_NOMEM;
+    }
+    for (y = 0; y < height; y++) {
+        const uint8_t *row = rgb + (size_t)y * (size_t)stride;
+        int forward = (y % 2) == 0;
+        int x = forward ? 0 : width - 1;
+        int step = forward ? 1 : -1;
+        int seen = 0;
+        while (seen < width) {
+            uint8_t sample[3];
+            int chosen = 0;
+            int second = 0;
+            int prev_x = x - step;
+            int drop_error = 0;
+            int c;
+            if (prev_x >= 0 && prev_x < width && channel_l1(row + x * 3, row + prev_x * 3) >= TCHIPNG_MIX_L1) {
+                drop_error = 1;
+            }
+            if (y > 0 && channel_l1(row + x * 3, row - stride + x * 3) >= TCHIPNG_MIX_L1) {
+                drop_error = 1;
+            }
+            if (drop_error) {
+                for (c = 0; c < 3; c++) {
+                    curr[(size_t)x * 3 + (size_t)c] = 0;
+                }
+            }
+            for (c = 0; c < 3; c++) {
+                int value = (int)row[x * 3 + c] + (int)curr[(size_t)x * 3 + (size_t)c];
+                if (value < 0) {
+                    value = 0;
+                }
+                if (value > 255) {
+                    value = 255;
+                }
+                sample[c] = (uint8_t)value;
+            }
+            nearest_two(sample, palette, palette_count, &chosen, &second);
+            indexes[(size_t)y * (size_t)width + (size_t)x] = (uint8_t)chosen;
+            if (channel_l1(palette + chosen * 3, palette + second * 3) <= TCHIPNG_MIX_L1) {
+                int err[3];
+                int err_l1 = 0;
+                for (c = 0; c < 3; c++) {
+                    err[c] = (int)sample[c] - (int)palette[chosen * 3 + c];
+                    err_l1 += err[c] < 0 ? -err[c] : err[c];
+                }
+                if (err_l1 > 8) {
+                    for (c = 0; c < 3; c++) {
+                        int scaled = err[c] * 15 / 16;
+                        int right = scaled * 7 / 16;
+                        int below_left = scaled * 3 / 16;
+                        int below_right = scaled / 16;
+                        int below = scaled - right - below_left - below_right;
+                        add_diffused(curr, width, x + step, c, right);
+                        add_diffused(next, width, x - step, c, below_left);
+                        add_diffused(next, width, x, c, below);
+                        add_diffused(next, width, x + step, c, below_right);
+                    }
+                }
+            }
+            x += step;
+            seen++;
+        }
+        {
+            int16_t *swap = curr;
+            curr = next;
+            next = swap;
+        }
+        memset(next, 0, (size_t)width * 3 * sizeof(int16_t));
+    }
+    free(curr);
+    free(next);
+    return TCHIPNG_OK;
+}
+
 static int build_indexed(
     const uint8_t *rgb,
     int width,
@@ -607,8 +795,6 @@ static int build_indexed(
     int box_count = 0;
     uint8_t *indexes = NULL;
     size_t pixels;
-    int y;
-    int x;
     int status;
     int i;
     status = collect_unique(rgb, width, height, stride, &colors, &color_count);
@@ -635,13 +821,12 @@ static int build_indexed(
         free(colors);
         return TCHIPNG_ERR_NOMEM;
     }
-    for (y = 0; y < height; y++) {
-        const uint8_t *row = rgb + (size_t)y * (size_t)stride;
-        for (x = 0; x < width; x++) {
-            indexes[(size_t)y * (size_t)width + (size_t)x] = (uint8_t)nearest_index(row + x * 3, palette, *palette_count);
-        }
-    }
     free(colors);
+    status = diffuse_indexes(rgb, width, height, stride, palette, *palette_count, indexes);
+    if (status != TCHIPNG_OK) {
+        free(indexes);
+        return status;
+    }
     *out_indexes = indexes;
     return TCHIPNG_OK;
 }
