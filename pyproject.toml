@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "tchipng"
-version = "0.1.0"
+version = "0.2.0"
 description = "甜气可见色压缩，供本机命令行和 Python 调用"
 readme = "README.md"
 requires-python = ">=3.10"
